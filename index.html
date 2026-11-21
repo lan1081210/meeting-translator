@@ -949,6 +949,9 @@ async function enableLocalModel() {
       if (avail === "available") { setLocalStatus(label + "→中 已就绪"); continue; }
       if (avail === "unavailable") { setLocalStatus(label + "→中 该语言对不支持"); continue; }
       setLocalStatus(label + "→中 下载中…（首次可能几分钟）");
+      // 下载进度事件不一定触发，等太久给个诚实提示，别让按钮一直停在「下载中」
+      const watchdog = setTimeout(() => setLocalStatus(
+        label + "→中 下载较慢，仍在后台进行；下完会自动启用，可先关掉设置继续用 MyMemory"), 120000);
       let pct = "";
       const t = await Translator.create({
         sourceLanguage: from, targetLanguage: "zh",
@@ -958,7 +961,7 @@ async function enableLocalModel() {
             setLocalStatus(label + "→中 下载中 " + pct);
           });
         },
-      });
+      }).finally(() => clearTimeout(watchdog));
       localTranslatorCache[from + ">zh"] = t;
       setLocalStatus(label + "→中 下载完成");
     }
