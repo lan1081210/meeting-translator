@@ -652,7 +652,8 @@ function polishPunct(s) {
     .replace(/,[ \t]*(?=[\u4e00-\u9fff])/g, "，")
     .replace(/([\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])/g, "$1")
     .replace(/\s+([，。！？、；：])/g, "$1")
-    .replace(/([。！？])\1+/g, "$1");
+    .replace(/([。！？])\1+/g, "$1")
+    .replace(/([\u4e00-\u9fff])([.!?;]+)$/g, (m, c, p) => c + ({".": "。", "!": "！", "?": "？", ";": "；"}[p[0]]));
 }
 
 async function translateText(text, onDelta, onProvider) {
