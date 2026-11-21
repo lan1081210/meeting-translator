@@ -205,6 +205,8 @@
   .check input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
   .modal-actions { display: flex; gap: 10px; margin-top: 20px; }
   .modal-actions .spacer { flex: 1; }
+  .local-model .row { display: flex; align-items: center; gap: 10px; }
+  .local-model .local-status { font-size: 13px; opacity: .75; }
   .test-result { font-size: 12.5px; margin-top: 10px; min-height: 16px; }
   .test-result.ok { color: var(--green); }
   .test-result.err { color: var(--red); }
@@ -322,6 +324,13 @@
     </div>
     <label class="check"><input type="checkbox" id="setTts"> 语音播报译文（中文朗读）</label>
     <label class="check"><input type="checkbox" id="setInterim" checked> 显示实时字幕（识别中间态）</label>
+    <div class="field local-model">
+      <label>浏览器内置翻译模型（可选 — Chrome 138+，下载一次后本地推理，不耗免费接口额度）</label>
+      <div class="row">
+        <button id="btnLocalModel">下载 / 检查</button>
+        <span class="local-status" id="localModelStatus">未检查</span>
+      </div>
+    </div>
     <div class="modal-actions">
       <button id="btnTest">测试连接</button>
       <div class="spacer"></div>
@@ -394,7 +403,9 @@ function segNode(seg, kind) {
   div.dataset.id = seg.id;
   const ts = document.createElement("div");
   ts.className = "seg-ts";
-  ts.textContent = kind === "zh" ? seg.ts + " · 中文" : seg.ts + (seg.lang ? " · " + seg.lang : "");
+  ts.textContent = kind === "zh"
+    ? seg.ts + " · 中文" + (seg.provider ? " · " + seg.provider : "")
+    : seg.ts + (seg.lang ? " · " + seg.lang : "");
   const tx = document.createElement("div");
   tx.className = "seg-text";
   tx.textContent = kind === "zh" ? (seg.zh || "") : seg.src;
@@ -511,7 +522,20 @@ function fetchWithTimeout(url, opts, ms) {
   return fetch(url, {...opts, signal: ctrl.signal}).finally(() => clearTimeout(timer));
 }
 
-/* --- 提供方 1：浏览器内置翻译（Chrome 138+，本地模型，免费） --- */
+/* --- 通用：超时 / 等待 --- */
+function withTimeout(p, ms, tag) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error((tag || "timeout") + "-timeout")), ms);
+    Promise.resolve(p).then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); });
+  });
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/* --- 提供方 1：浏览器内置翻译（Chrome 138+，本地模型，免费） ---
+ * 只在模型已就绪（availability === "available"）时使用；状态是 downloadable / downloading
+ * 时 create() 会触发几百 MB 的模型下载，界面看着像卡死，所以直接跳过换下一个源。 */
 const localTranslatorCache = {};
 async function localTranslate(chunk) {
   if (typeof Translator === "undefined") throw new Error("no-local-translator");
@@ -520,27 +544,42 @@ async function localTranslate(chunk) {
     : srcLangCode();
   const key = src + ">zh";
   if (!localTranslatorCache[key]) {
-    const avail = await Translator.availability({sourceLanguage: src, targetLanguage: "zh"});
-    if (avail === "unavailable") throw new Error("no-local-translator");
-    localTranslatorCache[key] = await Translator.create({sourceLanguage: src, targetLanguage: "zh"});
+    const avail = await withTimeout(
+      Translator.availability({sourceLanguage: src, targetLanguage: "zh"}), 2500, "local-availability");
+    if (avail !== "available") throw new Error("local-not-ready");
+    localTranslatorCache[key] = await withTimeout(
+      Translator.create({sourceLanguage: src, targetLanguage: "zh"}), 8000, "local-create");
   }
-  return await localTranslatorCache[key].translate(chunk);
+  return await withTimeout(localTranslatorCache[key].translate(chunk), 8000, "local-translate");
 }
 
-/* --- 提供方 2：MyMemory 免费接口 --- */
+/* MyMemory 的译文带 HTML 实体，顺手还原 */
+function decodeEntities(s) {
+  return s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(+d));
+}
+
+/* --- 提供方 2：MyMemory 免费接口（主力，CORS 放开，无需 key） --- */
 async function mymemoryTranslate(chunk) {
   const s = loadSettings();
   const pair = (srcLangCode() === "auto" ? "Autodetect" : srcLangCode()) + "|zh-CN";
   const params = new URLSearchParams({q: chunk, langpair: pair});
   if (s.mymemoryKey) params.set("key", s.mymemoryKey);
-  const res = await fetchWithTimeout(
-    "https://api.mymemory.translated.net/get?" + params.toString(), {method: "GET"}, 9000);
-  if (res.status === 429) throw new Error("mymemory-429");
-  if (!res.ok) throw new Error("mymemory-" + res.status);
-  const j = await res.json();
-  const out = j && j.responseData && j.responseData.translatedText;
-  if (!out || j.responseStatus !== 200) throw new Error("mymemory-empty");
-  return out;
+  const url = "https://api.mymemory.translated.net/get?" + params.toString();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetchWithTimeout(url, {method: "GET"}, 9000);
+    if (res.status === 429) { await sleep(1200); continue; }  // 限流：歇一下再试，仍失败就换下一个源
+    if (!res.ok) throw new Error("mymemory-" + res.status);
+    const j = await res.json();
+    const out = j && j.responseData && j.responseData.translatedText;
+    if (typeof out !== "string") throw new Error("mymemory-empty");
+    if (j.responseStatus && j.responseStatus !== 200 && /LIMIT/i.test(out)) {
+      throw new Error("mymemory-limit");
+    }
+    return decodeEntities(out);
+  }
+  throw new Error("mymemory-429");
 }
 
 /* --- 提供方 3：Google 免费接口（公共 CORS 代理中转） --- */
@@ -560,7 +599,7 @@ async function gtxTranslate(chunk) {
   let lastErr = new Error("gtx-failed");
   for (const wrap of CORS_PROXIES) {
     try {
-      const res = await fetchWithTimeout(wrap(target), {method: "GET"}, 15000);
+      const res = await fetchWithTimeout(wrap(target), {method: "GET"}, 6000);
       if (!res.ok) { lastErr = new Error("gtx-" + res.status); continue; }
       return parseGtx(await res.text());
     } catch (e) { lastErr = e; }
@@ -574,16 +613,25 @@ const PROVIDERS = [
   {name: "Google 免费", fn: gtxTranslate},
 ];
 
+/* 翻译请求串行排队：MyMemory 连发会 429，排队后一次只发一条，段间留一点间隔 */
+let mtChain = Promise.resolve();
+function enqueueMT(fn) {
+  const run = mtChain.then(fn, fn);
+  mtChain = run.then(() => sleep(80), () => sleep(80));
+  return run;
+}
 async function translateChunk(chunk, onProvider) {
-  let lastErr = null;
-  for (const p of PROVIDERS) {
-    try {
-      const out = await p.fn(chunk);
-      if (onProvider) onProvider(p.name);
-      return out;
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error("all-providers-failed");
+  return enqueueMT(async () => {
+    let lastErr = null;
+    for (const p of PROVIDERS) {
+      try {
+        const out = await p.fn(chunk);
+        if (onProvider) onProvider(p.name);
+        return out;
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("all-providers-failed");
+  });
 }
 
 function applyGlossary(text) {
@@ -677,16 +725,20 @@ async function translateText(text, onDelta, onProvider) {
 async function translateSegment(seg) {
   try {
     setState("warn", "翻译中…", seg.src.slice(0, 26) + (seg.src.length > 26 ? "…" : ""));
-    await translateText(seg.src, (acc) => { seg.zh = acc; updateZh(seg); });
+    let used = "";
+    await translateText(seg.src, (acc) => { seg.zh = acc; updateZh(seg); }, (name) => { used = name; });
+    seg.provider = used;
     seg.done = true;
-    updateZh(seg);
     if (!seg.zh) seg.zh = "（无译文）";
+    updateZh(seg);
+    const tsNode = els.zhList.querySelector(`.seg[data-id="${seg.id}"] .seg-ts`);
+    if (tsNode && used) tsNode.textContent = seg.ts + " · 中文 · " + used;
     setState(state.recording ? "rec" : "ok", state.recording ? "聆听中" : "完成",
-             state.recording ? "麦克风收音中…" : "点击麦克风继续");
+             (state.recording ? "麦克风收音中" : "点击麦克风继续") + (used ? " · 译文来源 " + used : ""));
     if (loadSettings().tts) speakZh(seg.zh);
   } catch (e) {
     seg.done = true;
-    const msg = "翻译失败：免费翻译源暂不可用（" + e.message + "），稍后重试或检查网络";
+    const msg = "翻译源暂时都连不上（" + e.message + "）：稍等再试，或在设置里填 MyMemory Key 提高额度";
     const node = els.zhList.querySelector(`.seg[data-id="${seg.id}"] .seg-text`);
     if (node) node.innerHTML = "";
     if (node) {
@@ -753,7 +805,7 @@ function newRecognizer() {
       stopRecording(true);
       setState("err", "麦克风被拒绝", "请在浏览器地址栏允许麦克风权限后重试");
     } else if (ev.error === "network") {
-      setState("err", "识别服务网络异常", "检查网络后重新开始");
+      setState("err", "识别服务连不上", "Chrome 语音识别走 Google 服务器，网络需能访问 Google；也可先用「手动输入」");
     }
     // no-speech / aborted：静默，交给 onend 重启
   };
@@ -865,6 +917,7 @@ function openSettings() {
   $("setTts").checked = s.tts;
   $("setInterim").checked = s.interim;
   $("testResult").textContent = "";
+  setLocalStatus(Object.keys(localTranslatorCache).length ? "已就绪（本次会话）" : "未检查");
   els.overlay.classList.add("open");
 }
 function closeSettings() { els.overlay.classList.remove("open"); }
@@ -876,6 +929,45 @@ function collectSettings() {
     interim: $("setInterim").checked,
   };
 }
+/* 浏览器内置翻译模型：Chrome 要求下载必须由用户手势触发，
+ * 所以只能在设置里点按钮；下好之后 localTranslate 会自动优先用它。 */
+function setLocalStatus(text, cls) {
+  const n = $("localModelStatus");
+  if (!n) return;
+  n.textContent = text;
+  n.className = "local-status" + (cls ? " " + cls : "");
+}
+async function enableLocalModel() {
+  if (typeof Translator === "undefined") {
+    setLocalStatus("当前浏览器不支持，继续用 MyMemory", "err");
+    return;
+  }
+  setLocalStatus("检查中…");
+  try {
+    for (const [from, label] of [["en", "英"], ["ru", "俄"]]) {
+      const avail = await Translator.availability({sourceLanguage: from, targetLanguage: "zh"});
+      if (avail === "available") { setLocalStatus(label + "→中 已就绪"); continue; }
+      if (avail === "unavailable") { setLocalStatus(label + "→中 该语言对不支持"); continue; }
+      setLocalStatus(label + "→中 下载中…（首次可能几分钟）");
+      let pct = "";
+      const t = await Translator.create({
+        sourceLanguage: from, targetLanguage: "zh",
+        monitor(m) {
+          m.addEventListener("downloadprogress", (e) => {
+            pct = Math.round((e.loaded || 0) * 100) + "%";
+            setLocalStatus(label + "→中 下载中 " + pct);
+          });
+        },
+      });
+      localTranslatorCache[from + ">zh"] = t;
+      setLocalStatus(label + "→中 下载完成");
+    }
+    setLocalStatus("本地模型就绪，翻译不再走网络", "ok");
+  } catch (e) {
+    setLocalStatus("下载失败（" + e.message.slice(0, 40) + "），仍用 MyMemory", "err");
+  }
+}
+
 async function testConnection() {
   const tr = $("testResult");
   tr.className = "test-result";
@@ -902,6 +994,7 @@ $("btnSettingsSave").addEventListener("click", () => {
   setState("", "设置已保存", "配置保存在本机浏览器");
 });
 $("btnTest").addEventListener("click", testConnection);
+$("btnLocalModel").addEventListener("click", enableLocalModel);
 els.overlay.addEventListener("click", (e) => { if (e.target === els.overlay) closeSettings(); });
 $("btnFullscreen").addEventListener("click", () => {
   if (document.fullscreenElement) document.exitFullscreen();
