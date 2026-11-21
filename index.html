@@ -309,30 +309,16 @@
   <div class="modal">
     <h3>设置</h3>
     <div class="desc">
-      翻译由 DeepSeek 模型完成。API Key 只保存在本机浏览器（localStorage），不会上传到任何服务器。
+      翻译走免费公开接口，不消耗任何 token，无需付费。
+      优先使用浏览器内置翻译（如有），其次 MyMemory 免费接口。
     </div>
     <div class="field">
-      <label>DeepSeek API Key</label>
-      <input type="password" id="setKey" placeholder="sk-…">
+      <label>MyMemory 免费 Key（可选 — 在 mymemory.translated.net 免费注册，每日额度从 5,000 词升到 50,000 词）</label>
+      <input type="text" id="setKey" placeholder="留空即用匿名额度">
     </div>
     <div class="field">
-      <label>API 地址</label>
-      <input type="text" id="setBase" placeholder="https://api.deepseek.com">
-    </div>
-    <div class="field">
-      <label>模型</label>
-      <select id="setModel">
-        <option value="deepseek-chat">deepseek-chat（快，推荐）</option>
-        <option value="deepseek-reasoner">deepseek-reasoner（更斟酌）</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>术语表（可选 — 品牌名、人名、行业词，逐行填写）</label>
+      <label>术语表（可选 — 译后字面替换，逐行填写）</label>
       <textarea id="setGlossary" placeholder="例如：&#10;МГУ-ППИ = 深圳北理莫斯科大学&#10;SMBU = 深圳北理莫斯科大学"></textarea>
-    </div>
-    <div class="field">
-      <label>会议背景（可选 — 帮助模型更准确）</label>
-      <textarea id="setContext" placeholder="例如：这是一场中俄合作办学项目的学期总结会…"></textarea>
     </div>
     <label class="check"><input type="checkbox" id="setTts"> 语音播报译文（中文朗读）</label>
     <label class="check"><input type="checkbox" id="setInterim" checked> 显示实时字幕（识别中间态）</label>
@@ -373,8 +359,7 @@ const els = {
 /* ================= 设置 ================= */
 const SETTINGS_KEY = "mmt_settings_v1";
 const DEFAULTS = {
-  apiKey: "", baseUrl: "https://api.deepseek.com", model: "deepseek-chat",
-  glossary: "", context: "", tts: false, interim: true,
+  mymemoryKey: "", glossary: "", tts: false, interim: true,
 };
 function loadSettings() {
   try { return {...DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}")}; }
@@ -488,68 +473,210 @@ function updateZh(seg) {
   scrollBottom();
 }
 
-/* ================= DeepSeek 翻译 ================= */
-function buildSystemPrompt() {
-  const s = loadSettings();
-  let p = "你是一名资深会议同传译员。将用户给出的会议发言翻译成简体中文。" +
-          "发言可能是俄语或英语，请自动判断源语言。" +
-          "只输出译文本身：不加解释、不加引号、不加原文、不加任何前后缀。" +
-          "保留数字、专有名词的正确译法，语气自然口语化，适合会议场景。";
-  if (s.glossary.trim()) p += "\n\n必须遵守的术语表：\n" + s.glossary.trim();
-  if (s.context.trim()) p += "\n\n会议背景（供理解参考）：\n" + s.context.trim();
-  return p;
-}
-async function streamTranslate(text, onDelta) {
-  const s = loadSettings();
-  if (!s.apiKey) throw new Error("NO_KEY");
-  const base = (s.baseUrl || "https://api.deepseek.com").replace(/\/+$/, "");
-  const res = await fetch(base + "/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + s.apiKey,
-    },
-    body: JSON.stringify({
-      model: s.model || "deepseek-chat",
-      stream: true,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: buildSystemPrompt() },
-        { role: "user", content: text },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error("API " + res.status + (body ? ": " + body.slice(0, 160) : ""));
-  }
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, idx).trim();
-      buf = buf.slice(idx + 1);
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") return;
-      try {
-        const j = JSON.parse(data);
-        const d = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
-        if (d) onDelta(d);
-      } catch { /* 忽略半行 */ }
+/* ================= 免费翻译（零 key / 零 token） =================
+ * 提供链：
+ *   1. 浏览器内置 Translator API（本地推理，免费；浏览器支持时优先）
+ *   2. MyMemory 免费接口（直连，CORS 放开）
+ *   3. Google 免费接口经公共 CORS 代理（MyMemory 限流时兜底）
+ * 全部免费，无需注册付费服务。
+ */
+const CHUNK_LIMIT = 420;
+
+function splitChunks(text) {
+  if (text.length <= CHUNK_LIMIT) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > CHUNK_LIMIT) {
+    let cut = -1;
+    for (const p of ["。", "！", "？", "!", "?", ".", ";", "\n", "；", "…"]) {
+      const i = rest.lastIndexOf(p, CHUNK_LIMIT);
+      if (i > cut) cut = i;
     }
+    if (cut < CHUNK_LIMIT * 0.4) cut = CHUNK_LIMIT;
+    chunks.push(rest.slice(0, cut + 1).trim());
+    rest = rest.slice(cut + 1);
   }
+  if (rest.trim()) chunks.push(rest.trim());
+  return chunks;
+}
+
+function srcLangCode() {
+  const v = els.srcLang.value;
+  return v === "ru" ? "ru" : v === "en" ? "en" : "auto";
+}
+
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, {...opts, signal: ctrl.signal}).finally(() => clearTimeout(timer));
+}
+
+/* --- 提供方 1：浏览器内置翻译（Chrome 138+，本地模型，免费） --- */
+const localTranslatorCache = {};
+async function localTranslate(chunk) {
+  if (typeof Translator === "undefined") throw new Error("no-local-translator");
+  const src = srcLangCode() === "auto"
+    ? (/[\u0400-\u04FF]/.test(chunk) ? "ru" : "en")
+    : srcLangCode();
+  const key = src + ">zh";
+  if (!localTranslatorCache[key]) {
+    const avail = await Translator.availability({sourceLanguage: src, targetLanguage: "zh"});
+    if (avail === "unavailable") throw new Error("no-local-translator");
+    localTranslatorCache[key] = await Translator.create({sourceLanguage: src, targetLanguage: "zh"});
+  }
+  return await localTranslatorCache[key].translate(chunk);
+}
+
+/* --- 提供方 2：MyMemory 免费接口 --- */
+async function mymemoryTranslate(chunk) {
+  const s = loadSettings();
+  const pair = (srcLangCode() === "auto" ? "Autodetect" : srcLangCode()) + "|zh-CN";
+  const params = new URLSearchParams({q: chunk, langpair: pair});
+  if (s.mymemoryKey) params.set("key", s.mymemoryKey);
+  const res = await fetchWithTimeout(
+    "https://api.mymemory.translated.net/get?" + params.toString(), {method: "GET"}, 9000);
+  if (res.status === 429) throw new Error("mymemory-429");
+  if (!res.ok) throw new Error("mymemory-" + res.status);
+  const j = await res.json();
+  const out = j && j.responseData && j.responseData.translatedText;
+  if (!out || j.responseStatus !== 200) throw new Error("mymemory-empty");
+  return out;
+}
+
+/* --- 提供方 3：Google 免费接口（公共 CORS 代理中转） --- */
+const CORS_PROXIES = [
+  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+];
+function parseGtx(jsonText) {
+  const j = JSON.parse(jsonText);
+  if (!Array.isArray(j) || !Array.isArray(j[0])) throw new Error("gtx-parse");
+  return j[0].map(seg => seg[0]).join("").trim();
+}
+async function gtxTranslate(chunk) {
+  const sl = srcLangCode() === "auto" ? "auto" : srcLangCode();
+  const target = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=" +
+    sl + "&tl=zh-CN&dt=t&q=" + encodeURIComponent(chunk);
+  let lastErr = new Error("gtx-failed");
+  for (const wrap of CORS_PROXIES) {
+    try {
+      const res = await fetchWithTimeout(wrap(target), {method: "GET"}, 15000);
+      if (!res.ok) { lastErr = new Error("gtx-" + res.status); continue; }
+      return parseGtx(await res.text());
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
+const PROVIDERS = [
+  {name: "浏览器内置", fn: localTranslate},
+  {name: "MyMemory", fn: mymemoryTranslate},
+  {name: "Google 免费", fn: gtxTranslate},
+];
+
+async function translateChunk(chunk, onProvider) {
+  let lastErr = null;
+  for (const p of PROVIDERS) {
+    try {
+      const out = await p.fn(chunk);
+      if (onProvider) onProvider(p.name);
+      return out;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("all-providers-failed");
+}
+
+function applyGlossary(text) {
+  const g = loadSettings().glossary.trim();
+  if (!g) return text;
+  let out = text;
+  for (const line of g.split("\n")) {
+    const i = line.indexOf("=");
+    if (i <= 0) continue;
+    const src = line.slice(0, i).trim();
+    const dst = line.slice(i + 1).trim();
+    if (!src || !dst) continue;
+    out = out.split(src).join(dst);
+  }
+  return out;
+}
+
+function parseGlossary() {
+  const g = loadSettings().glossary.trim();
+  if (!g) return [];
+  const pairs = [];
+  for (const line of g.split("\n")) {
+    const i = line.indexOf("=");
+    if (i <= 0) continue;
+    const src = line.slice(0, i).trim();
+    const dst = line.slice(i + 1).trim();
+    if (src && dst) pairs.push({src, dst});
+  }
+  return pairs.sort((a, b) => b.src.length - a.src.length);
+}
+
+/* 术语切分：译前把术语从原文里剥出来，译完直插目标词，
+ * 避免机器翻译自作主张改写人名 / 缩写。 */
+function splitAroundGlossary(text) {
+  const pairs = parseGlossary();
+  if (!pairs.length) return [{term: false, text}];
+  const esc = pairs.map(p => p.src.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const re = new RegExp("(" + esc.join("|") + ")", "g");
+  const pieces = [];
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) pieces.push({term: false, text: text.slice(last, m.index)});
+    const hit = pairs.find(p => p.src === m[0]);
+    pieces.push({term: true, text: m[0], dst: hit ? hit.dst : m[0]});
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) pieces.push({term: false, text: text.slice(last)});
+  return pieces;
+}
+
+/* 标点不送翻译、原样保留：机器翻译经常吞掉片段开头 / 结尾的句读 */
+const EDGE = /[\s.,;:!?…"'«»“”‘’()\[\]{}。，、；：！？、·—–\-]/;
+async function translateFragment(text, onProvider) {
+  let lead = "", tail = "", mid = text;
+  while (mid.length && EDGE.test(mid[0])) { lead += mid[0]; mid = mid.slice(1); }
+  while (mid.length && EDGE.test(mid[mid.length - 1])) { tail = mid[mid.length - 1] + tail; mid = mid.slice(0, -1); }
+  if (!mid.trim()) return text;
+  return lead + await translateChunk(mid, onProvider) + tail;
+}
+
+/* 译文标点归一：ASCII 句读夹在中文里汉化，与中文终止符重复则去重 */
+function polishPunct(s) {
+  return s
+    .replace(/([。！？；…])[.!?;…]+/g, "$1")
+    .replace(/([.!?;])[ \t]*(?=[\u4e00-\u9fff])/g, (m, p) => ({".": "。", "!": "！", "?": "？", ";": "；"}[p]))
+    .replace(/,[ \t]*(?=[\u4e00-\u9fff])/g, "，")
+    .replace(/([\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])/g, "$1")
+    .replace(/\s+([，。！？、；：])/g, "$1")
+    .replace(/([。！？])\1+/g, "$1");
+}
+
+async function translateText(text, onDelta, onProvider) {
+  const chunks = splitChunks(text);
+  let acc = "";
+  for (const c of chunks) {
+    const pieces = splitAroundGlossary(c);
+    let part = "";
+    for (const piece of pieces) {
+      part += piece.term ? piece.dst : await translateFragment(piece.text, onProvider);
+    }
+    part = polishPunct(applyGlossary(part));
+    const cjkEnd = /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]$/.test(acc);
+    const cjkStart = /^[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(part);
+    acc += (acc && !(cjkEnd && cjkStart) && !/\s$/.test(acc) && !/^[，。！？、；：]/.test(part) ? " " : "") + part;
+    if (onDelta) onDelta(acc);
+  }
+  return acc;
 }
 
 async function translateSegment(seg) {
   try {
     setState("warn", "翻译中…", seg.src.slice(0, 26) + (seg.src.length > 26 ? "…" : ""));
-    await streamTranslate(seg.src, (d) => { seg.zh += d; updateZh(seg); });
+    await translateText(seg.src, (acc) => { seg.zh = acc; updateZh(seg); });
     seg.done = true;
     updateZh(seg);
     if (!seg.zh) seg.zh = "（无译文）";
@@ -558,9 +685,7 @@ async function translateSegment(seg) {
     if (loadSettings().tts) speakZh(seg.zh);
   } catch (e) {
     seg.done = true;
-    const msg = e.message === "NO_KEY"
-      ? "未配置 API Key，请点击右上角「设置」填写"
-      : "翻译失败：" + e.message;
+    const msg = "翻译失败：免费翻译源暂不可用（" + e.message + "），稍后重试或检查网络";
     const node = els.zhList.querySelector(`.seg[data-id="${seg.id}"] .seg-text`);
     if (node) node.innerHTML = "";
     if (node) {
@@ -569,7 +694,6 @@ async function translateSegment(seg) {
       node.appendChild(err);
     }
     setState("err", "出错", msg);
-    if (e.message === "NO_KEY") openSettings();
   }
 }
 
@@ -735,11 +859,8 @@ function exportTxt() {
 /* ================= 设置弹窗 ================= */
 function openSettings() {
   const s = loadSettings();
-  $("setKey").value = s.apiKey;
-  $("setBase").value = s.baseUrl;
-  $("setModel").value = s.model;
+  $("setKey").value = s.mymemoryKey;
   $("setGlossary").value = s.glossary;
-  $("setContext").value = s.context;
   $("setTts").checked = s.tts;
   $("setInterim").checked = s.interim;
   $("testResult").textContent = "";
@@ -748,11 +869,8 @@ function openSettings() {
 function closeSettings() { els.overlay.classList.remove("open"); }
 function collectSettings() {
   return {
-    apiKey: $("setKey").value.trim(),
-    baseUrl: $("setBase").value.trim() || "https://api.deepseek.com",
-    model: $("setModel").value,
+    mymemoryKey: $("setKey").value.trim(),
     glossary: $("setGlossary").value,
-    context: $("setContext").value,
     tts: $("setTts").checked,
     interim: $("setInterim").checked,
   };
@@ -763,13 +881,13 @@ async function testConnection() {
   tr.textContent = "测试中…";
   saveSettings(collectSettings());
   try {
-    let out = "";
-    await streamTranslate("ping", (d) => out += d);
+    let used = "";
+    const out = await translateText("hello, welcome to the meeting", null, (p) => used = p);
     tr.className = "test-result ok";
-    tr.textContent = "连接成功 ✓  返回：" + out.slice(0, 30);
+    tr.textContent = "连接成功 ✓  来源：" + used + "  译文：" + out.slice(0, 30);
   } catch (e) {
     tr.className = "test-result err";
-    tr.textContent = e.message === "NO_KEY" ? "请先填写 API Key" : "连接失败：" + e.message;
+    tr.textContent = "连接失败：" + e.message;
   }
 }
 

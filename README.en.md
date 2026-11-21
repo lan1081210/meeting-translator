@@ -2,15 +2,18 @@
 
 [中文](README.md)
 
-A web-based real-time meeting translator: microphone capture → speech recognition (Russian / English) → streaming translation into Simplified Chinese via DeepSeek. Original and translation are shown side by side, with optional voice readout and transcript export. Pure static HTML, no backend.
+A web-based real-time meeting translator: microphone capture → speech recognition (Russian / English) → instant translation into Simplified Chinese via free translation APIs. Original and translation are shown side by side, with optional voice readout and transcript export. Pure static HTML, no backend, zero cost.
 
 ## Features
 
 - Real-time speech-to-text in the browser: Russian (ru-RU), English (en-US), and auto mode (adapts per utterance)
-- Streaming translation via DeepSeek API (deepseek-chat / deepseek-reasoner) — text appears word by word
+- Free translation (no API key, no tokens burned):
+  1. Browser built-in translation engine (on-device, used first when available)
+  2. MyMemory free translation API (direct)
+  3. Google free translation endpoint (via public CORS proxy, as fallback)
 - Display modes: dual panel / single panel / original only / translation only; adjustable font size; fullscreen (projection friendly)
 - Voice readout of the Chinese translation (browser TTS)
-- Glossary and meeting context settings for better terminology alignment
+- Glossary: literal post-translation replacement for names and terms
 - Manual input for quiet environments
 - Timestamped transcript export and copy-to-clipboard
 
@@ -23,14 +26,19 @@ A web-based real-time meeting translator: microphone capture → speech recognit
    # open http://localhost:8000
    ```
 
-2. Click "⚙ 设置" (Settings) in the top-right and enter your DeepSeek API key (get one at [platform.deepseek.com](https://platform.deepseek.com/)).
-3. Pick a language (Russian / English / auto) and press the microphone to start.
+2. Press the microphone to start — original text on the left, Chinese translation on the right.
+3. (Optional) Add glossary entries in Settings; register a free key at mymemory.translated.net to raise the daily quota from 5,000 to 50,000 words.
 
-The API key is stored only in your browser's localStorage. Translation requests go directly from the browser to the DeepSeek API — no third-party server involved.
+No paid API key required — all translation goes through free public endpoints.
+
+## Free Quota Notes
+
+- MyMemory anonymous quota: about 5,000 words/day — enough for typical meetings; register a free key for heavy use.
+- Free endpoints occasionally rate-limit; the app automatically falls back to the next free source and shows a retry notice if all fail.
 
 ## Deployment
 
-Static files — deploy to GitHub Pages or any static host. On public deployments, each user enters their own API key in Settings.
+Static files — deploy to GitHub Pages or any static host.
 
 ## Browser Support
 
@@ -42,7 +50,7 @@ Static files — deploy to GitHub Pages or any static host. On public deployment
 ## Notes
 
 - Speech recognition is provided by the browser's built-in engine; quality depends on the browser and network.
-- Translation quality depends on the DeepSeek model; use the glossary and meeting context settings.
+- Translation quality is machine-translation grade; use the glossary to align proper nouns.
 
 ---
 
